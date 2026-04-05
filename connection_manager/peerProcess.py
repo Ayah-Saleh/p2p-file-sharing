@@ -2,8 +2,9 @@
 # this is the entry point script that runs one peer in the network
 import sys
 import time
+from logger import PeerLogger
 from .config import read_common_cfg, read_peerinfo_cfg
-from .network import PeerNode
+from .protocol_node import ProtocolPeerNode
 
 def main():
     # check that the user gave us a peer id as an argument
@@ -33,7 +34,8 @@ def main():
     print(f"[{peer_id}] I am {me.host}:{me.port}, has_file={me.has_file}")
 
     # create the network node and start it (sets up server and connects to smaller peers)
-    node = PeerNode(peer_id, peers)
+    logger = PeerLogger(peer_id)
+    node = ProtocolPeerNode(peer_id, peers, common, logger)
     node.start()
 
     try:

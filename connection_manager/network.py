@@ -6,6 +6,9 @@ import struct
 import threading
 from typing import Dict, Optional, Tuple
 
+from protocol.framing import recv_message, send_message as send_protocol_message
+from protocol.messages import Message
+
 # the spec says the handshake is 32 bytes total
 # first 18 bytes are the string "P2PFILESHARINGPROJ"
 HANDSHAKE_HEADER = b"P2PFILESHARINGPROJ"
@@ -216,14 +219,9 @@ class PeerNode:
         # (this is where we'll parse messages later)
         try:
             while not self.shutdown_event.is_set():
-                # try to read up to 4kb of data from the socket
-                data = sock.recv(4096)
-                if not data:
-                    # if we get no data, the connection closed
-                    break
-                # hand the raw data off to the protocol layer via the hook
-                self.on_raw_data(remote_id, data)
-        except OSError:
+                msg = recv_message(sock)
+                self.on_message(remote_id, msg)
+        except (ConnectionError, OSError, ValueError):
             # socket was closed or errored
             pass
         finally:
@@ -239,6 +237,16 @@ class PeerNode:
             self.on_disconnected(remote_id)
 
     # -------- hooks for the protocol layer to implement --------
+    def send_message(self, remote_id: int, msg: Message) -> None:
+        # look up the socket for this peer before sending a framed message
+        with self.conn_lock:
+            sock = self.connections.get(remote_id)
+
+        if sock is None:
+            raise ConnectionError(f"Peer {remote_id} is not connected")
+
+        send_protocol_message(sock, msg)
+
     def on_connected(self, remote_id: int) -> None:
         # called when handshake is done and connection is active
         # protocol layer should override this to send bitfield
@@ -247,6 +255,11 @@ class PeerNode:
     def on_raw_data(self, remote_id: int, data: bytes) -> None:
         # called when we receive raw bytes from a peer
         # protocol layer should override this to parse messages
+        return
+
+    def on_message(self, remote_id: int, msg: Message) -> None:
+        # called when we receive one full framed message from a peer
+        # protocol layer should override this to dispatch by message type
         return
 
     def on_disconnected(self, remote_id: int) -> None:

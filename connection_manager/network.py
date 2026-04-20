@@ -4,6 +4,7 @@
 import socket
 import struct
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 from protocol.framing import recv_message, send_message as send_protocol_message
@@ -161,20 +162,43 @@ class PeerNode:
                     pass
 
     def _connect_to_smaller_peers(self) -> None:
-        # connect to all peers with smaller peer_ids than us
+        # connect to all peers with smaller peer_ids than us in parallel threads
         # (this way each pair only makes one connection: the higher id connects to the lower)
+        # using threads so all outgoing connections happen simultaneously instead of one-by-one
+        threads = []
         for pid in sorted(self.peers.keys()):
             if pid < self.self_id:
-                self._connect_to_peer(pid)
+                t = threading.Thread(target=self._connect_to_peer_safe, args=(pid,), daemon=True)
+                threads.append(t)
+                t.start()
+        # wait for all outgoing connection attempts to finish before returning
+        for t in threads:
+            t.join()
+
+    def _connect_to_peer_safe(self, peer_id: int) -> None:
+        # wrapper that catches exceptions so a failed connection doesn't crash the thread
+        try:
+            self._connect_to_peer(peer_id)
+        except Exception as e:
+            print(f"[{self.self_id}] Could not connect to peer {peer_id}: {e}")
 
     def _connect_to_peer(self, peer_id: int) -> None:
         # initiate an outgoing connection to a specific peer
+        # retry up to 10 times in case the other peer hasn't started yet
         peer = self.peers[peer_id]
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        print(f"[{self.self_id}] Connecting to {peer_id} at {peer.host}:{peer.port} ...")
-        sock.connect((peer.host, peer.port))
+        max_retries = 10
+        for attempt in range(max_retries):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                print(f"[{self.self_id}] Connecting to {peer_id} at {peer.host}:{peer.port} (attempt {attempt+1})...")
+                sock.connect((peer.host, peer.port))
+                break  # connected successfully
+            except ConnectionRefusedError:
+                sock.close()
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(3)  # wait 3 seconds before retrying
 
         # spec says: outgoing connection, we send handshake first
         sock.sendall(build_handshake(self.self_id))
@@ -206,6 +230,12 @@ class PeerNode:
         direction = "IN " if incoming else "OUT"
         print(f"[{self.self_id}] {direction} connected with peer {remote_id}")
 
+        # call the tcp logging hook - incoming vs outgoing matters for the log message
+        if incoming:
+            self.on_tcp_connected_from(remote_id)
+        else:
+            self.on_tcp_connected_to(remote_id)
+
         # call the on_connected hook so the protocol layer knows we're ready
         self.on_connected(remote_id)
 
@@ -216,13 +246,17 @@ class PeerNode:
 
     def _reader_loop(self, remote_id: int, sock: socket.socket) -> None:
         # continuously read data from a peer's socket
-        # (this is where we'll parse messages later)
         try:
             while not self.shutdown_event.is_set():
                 msg = recv_message(sock)
-                self.on_message(remote_id, msg)
+                try:
+                    # handle the message - wrap separately so a handler bug doesnt
+                    # kill the connection (only real socket errors should do that)
+                    self.on_message(remote_id, msg)
+                except Exception as e:
+                    print(f"[{self.self_id}] Handler error from peer {remote_id}: {e}")
         except (ConnectionError, OSError, ValueError):
-            # socket was closed or errored
+            # socket was closed or errored - expected when peer disconnects
             pass
         finally:
             # clean up: remove from connections dict and close the socket
@@ -242,14 +276,31 @@ class PeerNode:
         with self.conn_lock:
             sock = self.connections.get(remote_id)
 
+        # peer might have disconnected between when we looked them up and when we send
+        # silently drop the send instead of raising - callers (broadcast loops, etc)
+        # should not crash just because one peer dropped
         if sock is None:
-            raise ConnectionError(f"Peer {remote_id} is not connected")
+            return
 
-        send_protocol_message(sock, msg)
+        try:
+            send_protocol_message(sock, msg)
+        except OSError:
+            # connection broke mid-send - the reader thread will notice and clean it up
+            pass
 
     def on_connected(self, remote_id: int) -> None:
         # called when handshake is done and connection is active
         # protocol layer should override this to send bitfield
+        pass
+
+    def on_tcp_connected_to(self, remote_id: int) -> None:
+        # called when WE made the outgoing connection to remote_id
+        # spec log: "Peer X makes a connection to Peer Y"
+        pass
+
+    def on_tcp_connected_from(self, remote_id: int) -> None:
+        # called when remote_id connected TO us (incoming)
+        # spec log: "Peer X is connected from Peer Y"
         pass
 
     def on_raw_data(self, remote_id: int, data: bytes) -> None:

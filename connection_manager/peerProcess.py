@@ -39,11 +39,13 @@ def main():
     node.start()
 
     try:
-        # keep the peer running and print status periodically
-        while True:
+        # keep the peer running and print status every 2 seconds
+        # also check if the node has shut itself down (all peers done)
+        while not node.shutdown_event.is_set():
             time.sleep(2)
             # show which peers we're connected to
             print(f"[{peer_id}] Connected peers: {node.get_connected_peer_ids()}")
+        print(f"[{peer_id}] Node has shut down cleanly.")
     except KeyboardInterrupt:
         # shutdown when user presses Ctrl+C
         print(f"[{peer_id}] Shutting down...")

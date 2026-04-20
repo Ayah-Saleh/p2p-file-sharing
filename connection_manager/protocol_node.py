@@ -219,8 +219,13 @@ class ProtocolPeerNode(PeerNode):
         with self.state_lock:
             self._get_state(remote_id).peer_interested = False
         self.logger.receiving_not_interested(remote_id)
-        # tell the choking handler too so it doesnt waste an unchoke slot on this peer
         self.choking_handler.set_interested(remote_id, False)
+        # if we have the complete file and they are not interested in us,
+        # they must have everything we have - meaning they are done
+        # this is the most reliable way to detect completion across machines
+        if self.local_bitfield.is_complete():
+            self.peers_with_complete_file.add(remote_id)
+            self._check_all_done()
 
     def _handle_have(self, remote_id: int, msg: Message) -> None:
         # they just got a new piece, update their bitfield in our records

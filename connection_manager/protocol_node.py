@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import os
 import threading
 from typing import Optional
 from choking_handler import ChokingHandler
@@ -19,17 +20,6 @@ from protocol.messages import (
 from .config import CommonConfig, PeerInfo
 from .network import PeerNode
 
-
-@dataclass
-class PeerMessageState:
-    peer_bitfield: Bitfield
-    peer_choking_me: bool = True
-    am_interested: bool = False
-    peer_interested: bool = False
-    requested_piece: Optional[int] = None
-
-
-class ProtocolPeerNode(PeerNode):
 class FileStorage:
     # this class deals with reading/writing the actual file pieces to disk
     # basically each peer has its own folder like peer_1001/ and the file lives there
@@ -134,7 +124,6 @@ class ProtocolPeerNode(PeerNode):
                                               bitfield=self.local_bitfield,
                                               protocol_node=self)
 
-    def on_connected(self, remote_id: int) -> None:
         # create protocol state for the peer as soon as the handshake is done
     def on_connected(self, remote_id: int) -> None:
         # called right after handshake finishes with a new peer
@@ -153,17 +142,9 @@ class ProtocolPeerNode(PeerNode):
         self.send_message(remote_id, Message(MsgType.UNCHOKE))
 
         self.choking_handler.add_neighbor(remote_id)
-        self.choking_handler.start_timer()
-
-    def on_message(self, remote_id: int, msg: Message) -> None:
-        # route each incoming message to the matching protocol handler
-        # spec says: send bitfield right after handshake (skip if we have nothing)
-        if not self.local_bitfield.is_empty():
-            self.send_message(remote_id, Message(MsgType.BITFIELD, self.local_bitfield.to_bytes()))
-
-        # TODO: once choking handler is wired in, remove this placeholder unchoke
-        # for now just unchoke everyone so pieces actually flow
-        self.send_message(remote_id, Message(MsgType.UNCHOKE))
+        if not hasattr(self, "timers_started"):
+            self.choking_handler.start_timer()
+            self.timers_started = True
 
     def on_message(self, remote_id: int, msg: Message) -> None:
         # this gets called every time a full message comes in from a peer
@@ -250,9 +231,9 @@ class ProtocolPeerNode(PeerNode):
         if not self.local_bitfield.has_piece(piece_index):
             return
 
-        # piece storage is still a placeholder, so respond with zeroed bytes of the right size
-        piece_size = self._piece_size(piece_index)
-        piece_data = b"\x00" * piece_size
+        # # piece storage is still a placeholder, so respond with zeroed bytes of the right size
+        # piece_size = self._piece_size(piece_index)
+        # piece_data = b"\x00" * piece_size
         # read the actual piece data from disk and send it back
         piece_data = self.file_storage.read_piece(piece_index)
         payload = build_piece_payload(piece_index, piece_data)
@@ -265,7 +246,7 @@ class ProtocolPeerNode(PeerNode):
 
         # we got a piece back! save it to disk, update our bitfield,
         # tell everyone else we have it, and try to request the next one
-        piece_index, piece_data = parse_piece_payload(msg.payload)
+       # piece_index, piece_data = parse_piece_payload(msg.payload)
 
         with self.state_lock:
             state = self._get_state(remote_id)
@@ -313,7 +294,6 @@ class ProtocolPeerNode(PeerNode):
         
         self.choking_handler.set_interested(remote_id, interesting)
 
-    def _request_next_piece(self, remote_id: int) -> None:
 
     def _request_next_piece(self, remote_id: int) -> None:
         # try to request one piece from this peer

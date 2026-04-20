@@ -1,9 +1,11 @@
 from dataclasses import dataclass
 import os
+import random
 import threading
 from typing import Optional
 
 from bitfield import Bitfield
+from choking_handler import ChokingHandler
 from logger import PeerLogger
 from protocol.messages import (
     Message,
@@ -91,6 +93,7 @@ class PeerMessageState:
     # like are they choking us, are we interested in their stuff, etc
     peer_bitfield: Bitfield
     peer_choking_me: bool = True  # they start out choking us
+    am_choking_peer: bool = True  # we also start out choking them
     am_interested: bool = False  # we start out not interested
     peer_interested: bool = False  # they start out not interested in us
     requested_piece: Optional[int] = None  # which piece we asked them for (if any)
@@ -115,6 +118,24 @@ class ProtocolPeerNode(PeerNode):
         self.pending_requests: set[int] = set()
         self.peer_states: dict[int, PeerMessageState] = {}
         self.state_lock = threading.Lock()
+        self.all_complete_event = threading.Event()
+        self.choking_handler = ChokingHandler(
+            self_id,
+            logger,
+            common.k,
+            common.unchoke_interval,
+            common.optimistic_unchoke_interval,
+            bitfield_state=self.local_bitfield,
+            state_change_callback=self._on_choke_state_change,
+        )
+
+    def start(self) -> None:
+        super().start()
+        self.choking_handler.start_timer()
+
+    def shutdown(self) -> None:
+        self.choking_handler.stop()
+        super().shutdown()
 
     def on_connected(self, remote_id: int) -> None:
         # called right after handshake finishes with a new peer
@@ -124,14 +145,13 @@ class ProtocolPeerNode(PeerNode):
                 remote_id,
                 PeerMessageState(peer_bitfield=Bitfield(self.common.num_pieces)),
             )
+        self.choking_handler.add_neighbor(remote_id)
 
         # spec says: send bitfield right after handshake (skip if we have nothing)
         if not self.local_bitfield.is_empty():
             self.send_message(remote_id, Message(MsgType.BITFIELD, self.local_bitfield.to_bytes()))
 
-        # TODO: once choking handler is wired in, remove this placeholder unchoke
-        # for now just unchoke everyone so pieces actually flow
-        self.send_message(remote_id, Message(MsgType.UNCHOKE))
+        self._update_completion_state()
 
     def on_message(self, remote_id: int, msg: Message) -> None:
         # this gets called every time a full message comes in from a peer
@@ -155,6 +175,8 @@ class ProtocolPeerNode(PeerNode):
             state = self.peer_states.pop(remote_id, None)
             if state is not None and state.requested_piece is not None:
                 self.pending_requests.discard(state.requested_piece)
+        self.choking_handler.remove_neighbor(remote_id)
+        self._update_completion_state()
 
     def _handle_choke(self, remote_id: int, msg: Message) -> None:
         # they choked us so we cant request pieces from them anymore
@@ -178,12 +200,14 @@ class ProtocolPeerNode(PeerNode):
         # they want something we have
         with self.state_lock:
             self._get_state(remote_id).peer_interested = True
+        self.choking_handler.set_interested(remote_id, True)
         self.logger.receiving_interested(remote_id)
 
     def _handle_not_interested(self, remote_id: int, msg: Message) -> None:
         # they dont need anything from us anymore
         with self.state_lock:
             self._get_state(remote_id).peer_interested = False
+        self.choking_handler.set_interested(remote_id, False)
         self.logger.receiving_not_interested(remote_id)
 
     def _handle_have(self, remote_id: int, msg: Message) -> None:
@@ -197,6 +221,7 @@ class ProtocolPeerNode(PeerNode):
 
         self._sync_interest(remote_id)
         self._request_next_piece(remote_id)
+        self._update_completion_state()
 
     def _handle_bitfield(self, remote_id: int, msg: Message) -> None:
         # spec says this is the first message after handshake
@@ -208,11 +233,16 @@ class ProtocolPeerNode(PeerNode):
 
         self._sync_interest(remote_id)
         self._request_next_piece(remote_id)
+        self._update_completion_state()
 
     def _handle_request(self, remote_id: int, msg: Message) -> None:
         # they asked us for a specific piece
         # read it from disk and send it back
         piece_index = parse_request_payload(msg.payload)
+
+        with self.state_lock:
+            if self._get_state(remote_id).am_choking_peer:
+                return
 
         # ignore requests for pieces we do not currently have
         if not self.local_bitfield.has_piece(piece_index):
@@ -244,6 +274,7 @@ class ProtocolPeerNode(PeerNode):
                 piece_count = self.local_bitfield.count()
 
         if piece_data and not already_had_piece:
+            self.choking_handler.record_bytes_received(remote_id, len(piece_data))
             self.logger.downloading_piece(remote_id, piece_index, piece_count)
 
             if self.local_bitfield.is_complete():
@@ -253,6 +284,7 @@ class ProtocolPeerNode(PeerNode):
 
         self._refresh_interest_for_all_peers()
         self._request_next_piece(remote_id)
+        self._update_completion_state()
 
     def _sync_interest(self, remote_id: int) -> None:
         # check if they have any pieces we dont
@@ -293,10 +325,13 @@ class ProtocolPeerNode(PeerNode):
 
     def _choose_piece_to_request(self, peer_bitfield: Bitfield) -> Optional[int]:
         # find a piece they have that we dont, and that nobody else is sending us already
+        candidates = []
         for piece_index in self.local_bitfield.interesting_pieces(peer_bitfield):
             if piece_index not in self.pending_requests:
-                return piece_index
-        return None
+                candidates.append(piece_index)
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def _broadcast_have(self, piece_index: int) -> None:
         # spec says: when you get a new piece, tell ALL your neighbors about it
@@ -328,3 +363,41 @@ class ProtocolPeerNode(PeerNode):
             remote_id,
             PeerMessageState(peer_bitfield=Bitfield(self.common.num_pieces)),
         )
+
+    def _on_choke_state_change(self, choke_state: dict[int, bool]) -> None:
+        messages_to_send: list[tuple[int, MsgType]] = []
+
+        with self.state_lock:
+            for remote_id, is_choked in choke_state.items():
+                state = self._get_state(remote_id)
+                if state.am_choking_peer == is_choked:
+                    continue
+                state.am_choking_peer = is_choked
+                if is_choked:
+                    messages_to_send.append((remote_id, MsgType.CHOKE))
+                else:
+                    messages_to_send.append((remote_id, MsgType.UNCHOKE))
+
+        for remote_id, msg_type in messages_to_send:
+            self.send_message(remote_id, Message(msg_type))
+
+    def is_network_complete(self) -> bool:
+        return self.all_complete_event.is_set()
+
+    def _update_completion_state(self) -> None:
+        with self.state_lock:
+            if not self.local_bitfield.is_complete():
+                return
+
+            expected_peer_count = len(self.peers) - 1
+            if len(self.peer_states) < expected_peer_count:
+                return
+
+            for peer_id in self.peers:
+                if peer_id == self.self_id:
+                    continue
+                state = self.peer_states.get(peer_id)
+                if state is None or not state.peer_bitfield.is_complete():
+                    return
+
+        self.all_complete_event.set()

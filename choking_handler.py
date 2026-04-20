@@ -2,14 +2,16 @@ import random
 import threading
 import bitfield
 
+
 class ChokingHandler:
-    def __init__(self, peer_id, logger, k, p_interval, m_interval):
+    def __init__(self, peer_id, logger, k, p_interval, m_interval, bitfield_state=None, state_change_callback=None):
         self.peer_id = peer_id
         self.logger = logger
         self.k = k
         self.p_interval = p_interval
         self.m_interval = m_interval
-        self.bitfield = bitfield
+        self.bitfield = bitfield_state if bitfield_state is not None else bitfield
+        self.state_change_callback = state_change_callback
 
         self.neighbors = {}
         self.optimistic_neighbor_id = None
@@ -25,6 +27,11 @@ class ChokingHandler:
     def add_neighbor(self, neighbor_id):
         with self.lock:
             self.neighbors[neighbor_id] = {"interested": False, "choked": True, "num_bytes_received": 0 }
+
+    def remove_neighbor(self, neighbor_id):
+        with self.lock:
+            self.neighbors.pop(neighbor_id, None)
+
     def set_interested(self, neighbor_id, is_interested):
         with self.lock:
             if neighbor_id in self.neighbors:
@@ -61,6 +68,10 @@ class ChokingHandler:
                 if self.neighbors[neighbor_id]["interested"]:
                     list_interested.append(neighbor_id)
             if len(list_interested) == 0:
+                for id in self.neighbors:
+                    if id != self.optimistic_neighbor_id:
+                        self.neighbors[id]["choked"] = True
+                self._notify_state_change()
                 return
             
             # if the file is complete, then we randomly choose k neighbors
@@ -81,6 +92,7 @@ class ChokingHandler:
                 self.neighbors[id]["num_bytes_received"] = 0
             
             self.logger.change_preferred_neighbors(chosen_neighbor)
+            self._notify_state_change()
     
     def complete_file(self):
         return self.bitfield.is_complete()
@@ -135,6 +147,7 @@ class ChokingHandler:
             self.optimistic_neighbor_id = random.choice(choked_interested)
             self.neighbors[self.optimistic_neighbor_id]["choked"] = False
             self.logger.change_optimistic_unchoked_neighbors(self.optimistic_neighbor_id)
+            self._notify_state_change()
 
     def stop(self):
         # does the ptimer exist, only then cancel
@@ -143,6 +156,15 @@ class ChokingHandler:
         
         if hasattr(self, 'mtimer'):
             self.mtimer.cancel()
+
+    def _notify_state_change(self):
+        if self.state_change_callback is None:
+            return
+
+        snapshot = {}
+        for neighbor_id, state in self.neighbors.items():
+            snapshot[neighbor_id] = state["choked"]
+        self.state_change_callback(snapshot)
 
 
 

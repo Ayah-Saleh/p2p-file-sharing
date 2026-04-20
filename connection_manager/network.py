@@ -4,6 +4,7 @@
 import socket
 import struct
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 from protocol.framing import recv_message, send_message as send_protocol_message
@@ -61,6 +62,8 @@ class PeerNode:
 
         # lock to protect the connections dict so multiple threads don't mess it up
         self.conn_lock = threading.Lock()
+        # lock so framed sends do not interleave on the same socket
+        self.send_lock = threading.Lock()
         # dict mapping peer_id -> socket for all active connections
         self.connections: Dict[int, socket.socket] = {}
         # dict mapping peer_id -> thread for each peer's reader thread
@@ -170,25 +173,44 @@ class PeerNode:
     def _connect_to_peer(self, peer_id: int) -> None:
         # initiate an outgoing connection to a specific peer
         peer = self.peers[peer_id]
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        last_error: Optional[Exception] = None
 
-        print(f"[{self.self_id}] Connecting to {peer_id} at {peer.host}:{peer.port} ...")
-        sock.connect((peer.host, peer.port))
+        for _ in range(20):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # spec says: outgoing connection, we send handshake first
-        sock.sendall(build_handshake(self.self_id))
-        # then wait for their handshake back
-        their = recv_exact(sock, HANDSHAKE_LEN)
-        remote_id = parse_handshake(their)
+            try:
+                print(f"[{self.self_id}] Connecting to {peer_id} at {peer.host}:{peer.port} ...")
+                sock.connect((peer.host, peer.port))
 
-        # make sure we got a handshake from the right peer
-        if remote_id != peer_id:
-            sock.close()
-            raise ValueError(f"Connected to wrong peer: expected {peer_id}, got {remote_id}")
+                # spec says: outgoing connection, we send handshake first
+                sock.sendall(build_handshake(self.self_id))
+                # then wait for their handshake back
+                their = recv_exact(sock, HANDSHAKE_LEN)
+                remote_id = parse_handshake(their)
 
-        # add this connection to our active connections
-        self._register_connection(remote_id, sock, incoming=False)
+                # make sure we got a handshake from the right peer
+                if remote_id != peer_id:
+                    raise ValueError(f"Connected to wrong peer: expected {peer_id}, got {remote_id}")
+
+                # add this connection to our active connections
+                self._register_connection(remote_id, sock, incoming=False)
+                return
+            except ConnectionRefusedError as exc:
+                last_error = exc
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                time.sleep(0.5)
+            except Exception:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                raise
+
+        raise ConnectionError(f"Could not connect to peer {peer_id}") from last_error
 
     def _register_connection(self, remote_id: int, sock: socket.socket, incoming: bool) -> None:
         # add a new connection to our list and start a reader thread for it
@@ -205,6 +227,11 @@ class PeerNode:
         # print whether this was an incoming or outgoing connection
         direction = "IN " if incoming else "OUT"
         print(f"[{self.self_id}] {direction} connected with peer {remote_id}")
+        if hasattr(self, "logger"):
+            if incoming:
+                self.logger.log_tcp_connection_from_peer(remote_id)
+            else:
+                self.logger.log_tcp_connection_to_peer(remote_id)
 
         # call the on_connected hook so the protocol layer knows we're ready
         self.on_connected(remote_id)
@@ -245,7 +272,8 @@ class PeerNode:
         if sock is None:
             raise ConnectionError(f"Peer {remote_id} is not connected")
 
-        send_protocol_message(sock, msg)
+        with self.send_lock:
+            send_protocol_message(sock, msg)
 
     def on_connected(self, remote_id: int) -> None:
         # called when handshake is done and connection is active

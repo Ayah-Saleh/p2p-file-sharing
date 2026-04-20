@@ -44,6 +44,10 @@ def main():
             time.sleep(2)
             # show which peers we're connected to
             print(f"[{peer_id}] Connected peers: {node.get_connected_peer_ids()}")
+            if node.is_network_complete():
+                print(f"[{peer_id}] All peers completed. Shutting down...")
+                node.shutdown()
+                break
     except KeyboardInterrupt:
         # shutdown when user presses Ctrl+C
         print(f"[{peer_id}] Shutting down...")

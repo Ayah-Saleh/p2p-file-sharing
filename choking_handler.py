@@ -1,24 +1,20 @@
 import random
 import threading
-import bitfield
+from bitfield import Bitfield
+from protocol.messages import Message, MsgType
 
 class ChokingHandler:
-    def __init__(self, peer_id, logger, k, p_interval, m_interval):
+    def __init__(self, peer_id, logger, k, p_interval, m_interval, bitfield, protocol_node):
         self.peer_id = peer_id
         self.logger = logger
         self.k = k
         self.p_interval = p_interval
         self.m_interval = m_interval
         self.bitfield = bitfield
-
+        self.protocol_node = protocol_node
         self.neighbors = {}
         self.optimistic_neighbor_id = None
-
-    
-
         self.lock = threading.Lock()
-
-    
     
     # when new peer connects, it gets added to the dictionary of neighbors
     # we use self.lock because there are mutliple threads running at once
@@ -73,11 +69,16 @@ class ChokingHandler:
 
             for id in self.neighbors:
                 if id in chosen_neighbor:
-                    self.neighbors[id]["choked"] = False
+                    if self.neighbors[id]["choked"] == True:
+                        self.neighbors[id]["choked"] = False
+                        self.protocol_node.send_message(id, Message(MsgType.UNCHOKE))
                 elif id != self.optimistic_neighbor_id:
                     # all other neighbors get choked that were previously not unchoked, unless optimistic neighbor
-                    self.neighbors[id]["choked"] = True
-            for id in self.neighbors:
+                    if self.neighbors[id]["choked"] == False:
+                        self.neighbors[id]["choked"] = True
+                        self.protocol_node.send_message(id, Message(MsgType.CHOKE))
+                
+            for id in self.neighbors: 
                 self.neighbors[id]["num_bytes_received"] = 0
             
             self.logger.change_preferred_neighbors(chosen_neighbor)
@@ -116,9 +117,6 @@ class ChokingHandler:
         final_list = greater_than_last_peer + tie_break
 
         return final_list
-        
-
-
 
     def select_opt_unchoked_neighbors(self):
         #Every m seconds, peer A reselects an optimistically unchoked 
@@ -134,6 +132,7 @@ class ChokingHandler:
             
             self.optimistic_neighbor_id = random.choice(choked_interested)
             self.neighbors[self.optimistic_neighbor_id]["choked"] = False
+            self.protocol_node.send_message(self.optimistic_neighbor_id, Message(MsgType.UNCHOKE))
             self.logger.change_optimistic_unchoked_neighbors(self.optimistic_neighbor_id)
 
     def stop(self):

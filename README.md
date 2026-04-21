@@ -1,9 +1,20 @@
 # p2p-file-sharing
-To verify that all files in the project compile successfully, navigate to the project directory and run the following command. 
+Names: Gustavo Gabaldon, Ayah Saleh, Reha Mansoor, Austin Nickse
 
-## Compile All Files
+Update config with IP addresses
 
-```bash
-cd p2p-file-sharing
+Run all peers:
+python -m connection_manager.peerProcess 1001
+python -m connection_manager.peerProcess 1002
+python -m connection_manager.peerProcess 1003
+python -m connection_manager.peerProcess 1004
+python -m connection_manager.peerProcess 1005
+python -m connection_manager.peerProcess 1006
 
-python3 -m compileall .
+Verify files
+md5 peer_1001/tree.jpg peer_1002/tree.jpg peer_1003/tree.jpg
+md5 peer_1004/tree.jpg peer_1005/tree.jpg peer_1006/tree.jpg
+
+
+
+

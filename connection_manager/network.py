@@ -92,10 +92,13 @@ class PeerNode:
             socks = list(self.connections.values())
             self.connections.clear()
 
-        # shut down each socket
+        # half-close each socket (SHUT_WR not SHUT_RDWR) so the OS drains the
+        # send buffer before the connection tears down.  Using SHUT_RDWR sends a
+        # TCP RST which can silently discard data still in the receive buffer on
+        # the remote side (e.g. the final HAVE messages we just broadcast).
         for s in socks:
             try:
-                s.shutdown(socket.SHUT_RDWR)
+                s.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
             try:

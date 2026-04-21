@@ -187,6 +187,18 @@ class ProtocolPeerNode(PeerNode):
 
         self._check_all_done()
 
+        # Safety fallback: if we already have the complete file and every peer
+        # has now disconnected, there is nobody left to exchange data with.
+        # Any peers whose final HAVEs were lost in the network (e.g. due to a
+        # TCP RST race) would otherwise leave us stalled forever.
+        if self.local_bitfield.is_complete():
+            with self.conn_lock:
+                active_connections = len(self.connections)
+            if active_connections == 0:
+                print(f"[{self.self_id}] File complete and all peers disconnected - shutting down")
+                self.choking_handler.stop()
+                self.shutdown()
+
     def _handle_choke(self, remote_id: int, msg: Message) -> None:
         # they choked us so we cant request pieces from them anymore
         # also cancel any piece we were waiting on from them
